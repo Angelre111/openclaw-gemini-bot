@@ -180,6 +180,18 @@ app.post('/webhook/telegram', async (req, res) => {
     const userText = message.text;
     if (!chatId || !userText) return;
 
+    // ── /ping → diagnóstico rápido ─────────────────────────────────────────
+    if (userText === '/ping') {
+      await bot.telegram.sendMessage(chatId, '🟢 Bot activo. Probando Gemini...');
+      try {
+        const test = await askGemini('Di solo: "Gemini OK"');
+        await bot.telegram.sendMessage(chatId, `✅ Gemini responde: ${test}`);
+      } catch (err) {
+        await bot.telegram.sendMessage(chatId, `❌ Gemini falló: ${err.message}\n\nRevisa la GEMINI_API_KEY en Render.`);
+      }
+      return;
+    }
+
     // ── /start ────────────────────────────────────────────────────────────────
     if (userText.startsWith('/start')) {
       await bot.telegram.sendMessage(
@@ -188,10 +200,12 @@ app.post('/webhook/telegram', async (req, res) => {
         '📌 *Comandos:*\n' +
         '/start — Iniciar el bot\n' +
         '/help — Ver ayuda\n' +
+        '/ping — Verificar que Gemini funciona\n' +
         '/recordatorios — Ver tus recordatorios activos\n' +
         '/cancelar <número> — Cancelar un recordatorio\n\n' +
         '⏰ *Recordatorios:* solo dímelo en lenguaje natural:\n' +
         '"Recuérdame tomar agua a las 8pm"',
+        
         { parse_mode: 'Markdown' }
       );
       return;
@@ -268,11 +282,27 @@ app.post('/webhook/telegram', async (req, res) => {
       );
       console.log(`🔔 Recordatorio #${id} creado → ${time}`);
     } else {
-      await bot.telegram.sendMessage(chatId, aiResponse, { parse_mode: 'Markdown' });
+      // Intentar con Markdown; si falla, enviar como texto plano
+      try {
+        await bot.telegram.sendMessage(chatId, aiResponse, { parse_mode: 'Markdown' });
+      } catch (_) {
+        await bot.telegram.sendMessage(chatId, aiResponse);
+      }
     }
 
   } catch (error) {
     console.error('❌ Error al procesar el webhook:', error.message);
+    // Notificar al usuario que algo falló
+    try {
+      const chatId = req.body?.message?.chat?.id;
+      if (chatId) {
+        await bot.telegram.sendMessage(
+          chatId,
+          `⚠️ Ocurrió un error al procesar tu mensaje.\n\n_${error.message}_\n\nUsa /ping para diagnosticar.`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } catch (_) {}
   }
 });
 
