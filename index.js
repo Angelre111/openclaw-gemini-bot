@@ -28,7 +28,8 @@ const app = express();
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-const GEMINI_MODEL = 'gemini-3.8-flash';
+// Modelos en orden de preferencia (fallback automático si el principal falla)
+const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
 
 // Prompt de sistema — incluye instrucción especial para recordatorios
 const SYSTEM_INSTRUCTION = `Eres OpenClaw, un asistente personal inteligente, útil y conciso.
@@ -133,22 +134,58 @@ app.use(express.json());
  * @param {string} userMessage - Texto del usuario.
  * @returns {Promise<string>} Respuesta del modelo.
  */
+/** Pausa la ejecución el tiempo indicado. */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Envía un mensaje a Gemini con reintentos y modelo de respaldo.
+ * Prueba hasta 3 modelos; en cada uno reintenta hasta 3 veces si hay 503/429.
+ * @param {string} userMessage
+ * @returns {Promise<string>}
+ */
 async function askGemini(userMessage) {
-  const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-    config: {
-      systemInstruction: SYSTEM_INSTRUCTION,
-      temperature: 0.7,
-      maxOutputTokens: 1024,
-    },
-  });
+  let lastError;
 
-  const text = response?.candidates?.[0]?.content?.parts?.[0]?.text
-    ?? response?.text;
+  for (const model of GEMINI_MODELS) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            temperature: 0.7,
+            maxOutputTokens: 1024,
+          },
+        });
 
-  if (!text) throw new Error('Gemini no devolvió texto en la respuesta.');
-  return text.trim();
+        const text =
+          response?.candidates?.[0]?.content?.parts?.[0]?.text ?? response?.text;
+
+        if (!text) throw new Error('Gemini no devolvió texto en la respuesta.');
+        if (model !== GEMINI_MODELS[0]) console.log(`⚠️ Usando modelo de respaldo: ${model}`);
+        return text.trim();
+      } catch (err) {
+        lastError = err;
+        const isTemp =
+          err.message?.includes('503') ||
+          err.message?.includes('UNAVAILABLE') ||
+          err.message?.includes('429') ||
+          err.message?.includes('RESOURCE_EXHAUSTED');
+
+        if (isTemp && attempt < 3) {
+          const waitMs = attempt * 2000; // 2s luego 4s
+          console.log(`⏳ ${model} sobrecargado (intento ${attempt}/3). Reintentando en ${waitMs / 1000}s...`);
+          await sleep(waitMs);
+        } else {
+          console.log(`❌ ${model} falló: ${err.message?.substring(0, 80)}`);
+          break; // probar siguiente modelo
+        }
+      }
+    }
+  }
+
+  throw lastError ?? new Error('Todos los modelos de Gemini fallaron.');
 }
 
 // ─── Rutas del servidor web ───────────────────────────────────────────────────
