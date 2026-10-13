@@ -14,7 +14,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Instalamos solo dependencias de producción (sin devDependencies)
-RUN npm install --omit=dev --ignore-scripts && npm cache clean --force
+RUN npm install --omit=dev && npm cache clean --force
 
 # ─── Etapa 4: Código fuente ───────────────────────────────────────────────────
 COPY . .
