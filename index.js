@@ -28,7 +28,7 @@ const app = express();
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-3.8-flash';
 
 // Prompt de sistema — incluye instrucción especial para recordatorios
 const SYSTEM_INSTRUCTION = `Eres OpenClaw, un asistente personal inteligente, útil y conciso.
