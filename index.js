@@ -37,8 +37,14 @@ const openrouter = new OpenAI({
   },
 });
 
-// Modelo a utilizar (formato OpenRouter: proveedor/modelo:variante)
-const AI_MODEL = 'google/gemma-4-26b-a4b-it:free';
+// Modelo principal y fallbacks gratuitos de OpenRouter.
+// Si el primero devuelve 429/503, se prueban los siguientes en orden.
+const AI_MODELS = [
+  'google/gemma-4-26b-a4b-it:free',          // primario (solicitado)
+  'meta-llama/llama-3.1-8b-instruct:free',   // fallback 1 — muy fiable
+  'mistralai/mistral-7b-instruct:free',       // fallback 2 — siempre disponible
+];
+const AI_MODEL = AI_MODELS[0]; // referencia al modelo principal para logs
 
 // Prompt de sistema — incluye instrucción especial para recordatorios
 const SYSTEM_INSTRUCTION = `Eres OpenClaw, un asistente personal inteligente, útil y conciso.
@@ -137,63 +143,68 @@ function tryParseReminder(text) {
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(express.json());
 
-// ─── Función auxiliar: consultar a Gemini ────────────────────────────────────
-/**
- * Envía un mensaje al modelo Gemini y retorna el texto generado.
- * @param {string} userMessage - Texto del usuario.
- * @returns {Promise<string>} Respuesta del modelo.
- */
-/** Pausa la ejecución el tiempo indicado. */
+// ─── Función auxiliar: consultar a OpenRouter con fallback ────────────────────
+/** Pausa la ejecución el tiempo indicado en milisegundos. */
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Envía un mensaje a OpenRouter y retorna el texto generado.
- * Reintenta hasta 3 veces si el servicio está sobrecargado (503/429).
+ * Envía un mensaje a OpenRouter con fallback automático entre modelos.
+ * - Itera sobre AI_MODELS en orden (primario → fallback 1 → fallback 2).
+ * - En cada modelo reintenta 1 vez extra si hay 429/503.
+ * - Si el modelo falla definitivamente, pasa al siguiente sin esperar.
  * @param {string} userMessage
  * @returns {Promise<string>}
  */
 async function askAI(userMessage) {
   let lastError;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const completion = await openrouter.chat.completions.create({
-        model: AI_MODEL,
-        messages: [
-          { role: 'system', content: SYSTEM_INSTRUCTION },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0.7,
-        max_tokens: 1024,
-      });
+  for (const model of AI_MODELS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const completion = await openrouter.chat.completions.create({
+          model,
+          messages: [
+            { role: 'system', content: SYSTEM_INSTRUCTION },
+            { role: 'user', content: userMessage },
+          ],
+          temperature: 0.7,
+          max_tokens: 1024,
+        });
 
-      const text = completion?.choices?.[0]?.message?.content;
-      if (!text) throw new Error('OpenRouter no devolvió texto en la respuesta.');
-      return text.trim();
+        const text = completion?.choices?.[0]?.message?.content;
+        if (!text) throw new Error(`${model}: respuesta vacía.`);
 
-    } catch (err) {
-      lastError = err;
-      const isTemp =
-        err.status === 503 ||
-        err.status === 429 ||
-        err.message?.includes('503') ||
-        err.message?.includes('429') ||
-        err.message?.includes('rate limit') ||
-        err.message?.includes('overloaded');
+        if (model !== AI_MODELS[0]) {
+          console.log(`⚠️ Usando modelo de respaldo: ${model}`);
+        }
+        return text.trim();
 
-      if (isTemp && attempt < 3) {
-        const waitMs = attempt * 2000;
-        console.log(`⏳ OpenRouter sobrecargado (intento ${attempt}/3). Reintentando en ${waitMs / 1000}s...`);
-        await sleep(waitMs);
-      } else {
-        console.log(`❌ OpenRouter falló (intento ${attempt}/3): ${err.message?.substring(0, 80)}`);
-        break;
+      } catch (err) {
+        lastError = err;
+        const isTemp =
+          err.status === 429 ||
+          err.status === 503 ||
+          err.message?.includes('429') ||
+          err.message?.includes('503') ||
+          err.message?.includes('rate limit') ||
+          err.message?.includes('overloaded') ||
+          err.message?.includes('Provider returned error');
+
+        if (isTemp && attempt < 2) {
+          console.log(`⏳ ${model} sobrecargado (intento ${attempt}/2). Esperando 3s antes de reintentar...`);
+          await sleep(3000);
+        } else {
+          // Este modelo falló — pasar al siguiente
+          console.log(`❌ ${model} falló: ${err.message?.substring(0, 100)}`);
+          break;
+        }
       }
     }
   }
 
-  throw lastError ?? new Error('OpenRouter no respondió después de 3 intentos.');
+  throw lastError ?? new Error('Todos los modelos de OpenRouter fallaron.');
 }
+
 
 // ─── Rutas del servidor web ───────────────────────────────────────────────────
 
@@ -202,7 +213,8 @@ app.get('/', (req, res) => {
   res.status(200).json({
     status: 'ok',
     message: '🤖 OpenClaw activo',
-    model: AI_MODEL,
+    primaryModel: AI_MODEL,
+    fallbackModels: AI_MODELS.slice(1),
     provider: 'OpenRouter',
     timestamp: new Date().toISOString(),
     timezone: TZ,
