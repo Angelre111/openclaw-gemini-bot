@@ -3,13 +3,13 @@
 require('dotenv').config();
 const express = require('express');
 const { Telegraf } = require('telegraf');
-const { GoogleGenAI } = require('@google/genai');
+const OpenAI = require('openai');
 const cron = require('node-cron');
 
 // ─── Validación de variables de entorno ───────────────────────────────────────
 const {
   TELEGRAM_BOT_TOKEN,
-  GEMINI_API_KEY,
+  OPENROUTER_API_KEY,
   PORT = 3000,
   TZ = 'America/Caracas', // UTC-4, cámbiala si tu zona es diferente
 } = process.env;
@@ -18,19 +18,27 @@ if (!TELEGRAM_BOT_TOKEN) {
   console.error('❌ Error: TELEGRAM_BOT_TOKEN no está definido en las variables de entorno.');
   process.exit(1);
 }
-if (!GEMINI_API_KEY) {
-  console.error('❌ Error: GEMINI_API_KEY no está definido en las variables de entorno.');
+if (!OPENROUTER_API_KEY) {
+  console.error('❌ Error: OPENROUTER_API_KEY no está definido en las variables de entorno.');
   process.exit(1);
 }
 
 // ─── Clientes ─────────────────────────────────────────────────────────────────
 const app = express();
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-// Modelo principal y lista de fallbacks (se prueban en orden si el anterior falla)
-const GEMINI_MODEL = 'gemini-2.5-flash';
-const GEMINI_MODELS = [GEMINI_MODEL, 'gemini-2.0-flash', 'gemini-1.5-flash'];
+// ─── Cliente OpenAI compatible → OpenRouter ───────────────────────────────────
+const openrouter = new OpenAI({
+  apiKey: OPENROUTER_API_KEY,
+  baseURL: 'https://openrouter.ai/api/v1',
+  defaultHeaders: {
+    'HTTP-Referer': 'https://openclaw-bot.onrender.com', // informativo para OpenRouter
+    'X-Title': 'OpenClaw Telegram Bot',
+  },
+});
+
+// Modelo a utilizar (formato OpenRouter: proveedor/modelo:variante)
+const AI_MODEL = 'google/gemma-4-26b-a4b-it:free';
 
 // Prompt de sistema — incluye instrucción especial para recordatorios
 const SYSTEM_INSTRUCTION = `Eres OpenClaw, un asistente personal inteligente, útil y conciso.
@@ -139,54 +147,52 @@ app.use(express.json());
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Envía un mensaje a Gemini con reintentos y modelo de respaldo.
- * Prueba hasta 3 modelos; en cada uno reintenta hasta 3 veces si hay 503/429.
+ * Envía un mensaje a OpenRouter y retorna el texto generado.
+ * Reintenta hasta 3 veces si el servicio está sobrecargado (503/429).
  * @param {string} userMessage
  * @returns {Promise<string>}
  */
-async function askGemini(userMessage) {
+async function askAI(userMessage) {
   let lastError;
 
-  for (const model of GEMINI_MODELS) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            temperature: 0.7,
-            maxOutputTokens: 1024,
-          },
-        });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const completion = await openrouter.chat.completions.create({
+        model: AI_MODEL,
+        messages: [
+          { role: 'system', content: SYSTEM_INSTRUCTION },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.7,
+        max_tokens: 1024,
+      });
 
-        const text =
-          response?.candidates?.[0]?.content?.parts?.[0]?.text ?? response?.text;
+      const text = completion?.choices?.[0]?.message?.content;
+      if (!text) throw new Error('OpenRouter no devolvió texto en la respuesta.');
+      return text.trim();
 
-        if (!text) throw new Error('Gemini no devolvió texto en la respuesta.');
-        if (model !== GEMINI_MODELS[0]) console.log(`⚠️ Usando modelo de respaldo: ${model}`);
-        return text.trim();
-      } catch (err) {
-        lastError = err;
-        const isTemp =
-          err.message?.includes('503') ||
-          err.message?.includes('UNAVAILABLE') ||
-          err.message?.includes('429') ||
-          err.message?.includes('RESOURCE_EXHAUSTED');
+    } catch (err) {
+      lastError = err;
+      const isTemp =
+        err.status === 503 ||
+        err.status === 429 ||
+        err.message?.includes('503') ||
+        err.message?.includes('429') ||
+        err.message?.includes('rate limit') ||
+        err.message?.includes('overloaded');
 
-        if (isTemp && attempt < 3) {
-          const waitMs = attempt * 2000; // 2s luego 4s
-          console.log(`⏳ ${model} sobrecargado (intento ${attempt}/3). Reintentando en ${waitMs / 1000}s...`);
-          await sleep(waitMs);
-        } else {
-          console.log(`❌ ${model} falló: ${err.message?.substring(0, 80)}`);
-          break; // probar siguiente modelo
-        }
+      if (isTemp && attempt < 3) {
+        const waitMs = attempt * 2000;
+        console.log(`⏳ OpenRouter sobrecargado (intento ${attempt}/3). Reintentando en ${waitMs / 1000}s...`);
+        await sleep(waitMs);
+      } else {
+        console.log(`❌ OpenRouter falló (intento ${attempt}/3): ${err.message?.substring(0, 80)}`);
+        break;
       }
     }
   }
 
-  throw lastError ?? new Error('Todos los modelos de Gemini fallaron.');
+  throw lastError ?? new Error('OpenRouter no respondió después de 3 intentos.');
 }
 
 // ─── Rutas del servidor web ───────────────────────────────────────────────────
@@ -196,7 +202,8 @@ app.get('/', (req, res) => {
   res.status(200).json({
     status: 'ok',
     message: '🤖 OpenClaw activo',
-    model: GEMINI_MODEL,
+    model: AI_MODEL,
+    provider: 'OpenRouter',
     timestamp: new Date().toISOString(),
     timezone: TZ,
     activeReminders: [...reminders.values()].reduce((a, b) => a + b.length, 0),
@@ -220,12 +227,12 @@ app.post('/webhook/telegram', async (req, res) => {
 
     // ── /ping → diagnóstico rápido ─────────────────────────────────────────
     if (userText === '/ping') {
-      await bot.telegram.sendMessage(chatId, '🟢 Bot activo. Probando Gemini...');
+      await bot.telegram.sendMessage(chatId, `🟢 Bot activo. Probando OpenRouter (${AI_MODEL})...`);
       try {
-        const test = await askGemini('Di solo: "Gemini OK"');
-        await bot.telegram.sendMessage(chatId, `✅ Gemini responde: ${test}`);
+        const test = await askAI('Responde solo: "OpenRouter OK"');
+        await bot.telegram.sendMessage(chatId, `✅ OpenRouter responde: ${test}`);
       } catch (err) {
-        await bot.telegram.sendMessage(chatId, `❌ Gemini falló: ${err.message}\n\nRevisa la GEMINI_API_KEY en Render.`);
+        await bot.telegram.sendMessage(chatId, `❌ OpenRouter falló: ${err.message}\n\nRevisa la OPENROUTER_API_KEY en Render.`);
       }
       return;
     }
@@ -301,8 +308,8 @@ app.post('/webhook/telegram', async (req, res) => {
     await bot.telegram.sendChatAction(chatId, 'typing');
 
     console.log(`📩 Mensaje de ${message.from?.username || chatId}: "${userText}"`);
-    const aiResponse = await askGemini(userText);
-    console.log(`✨ Gemini raw: "${aiResponse.substring(0, 120)}"`);
+    const aiResponse = await askAI(userText);
+    console.log(`🤖 OpenRouter raw: "${aiResponse.substring(0, 120)}"`);  
 
     const reminderData = tryParseReminder(aiResponse);
 
@@ -346,8 +353,8 @@ app.post('/webhook/telegram', async (req, res) => {
 
 // ─── Iniciar servidor ─────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ Servidor OpenClaw (Gemini) escuchando en el puerto ${PORT}`);
-  console.log(`✨ Modelo: ${GEMINI_MODEL}`);
+  console.log(`✅ Servidor OpenClaw (OpenRouter) escuchando en el puerto ${PORT}`);
+  console.log(`🤖 Modelo: ${AI_MODEL}`);
   console.log(`🌍 Zona horaria: ${TZ}`);
   console.log(`🔗 Health check: GET  http://localhost:${PORT}/`);
   console.log(`📡 Webhook:      POST http://localhost:${PORT}/webhook/telegram`);
