@@ -40,9 +40,9 @@ const openrouter = new OpenAI({
 // Modelo principal y fallbacks gratuitos de OpenRouter.
 // Si el primero devuelve 429/503, se prueban los siguientes en orden.
 const AI_MODELS = [
-  'google/gemma-4-26b-a4b-it:free',          // primario (solicitado)
-  'meta-llama/llama-3.1-8b-instruct:free',   // fallback 1 — muy fiable
-  'mistralai/mistral-7b-instruct:free',       // fallback 2 — siempre disponible
+  'google/gemma-4-26b-a4b-it:free',              // primario
+  'nvidia/nemotron-3-ultra-550b-a55b:free',       // fallback 1 — NVIDIA 550B gratis
+  'nvidia/nemotron-3-super-120b-a12b:free',       // fallback 2 — NVIDIA 120B gratis
 ];
 const AI_MODEL = AI_MODELS[0]; // referencia al modelo principal para logs
 
